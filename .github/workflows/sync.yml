@@ -1,0 +1,713 @@
+name: V2Ray Node Cleaner
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 * * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  clean:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y curl jq python3 python3-pip
+          pip3 install pyyaml
+
+      - name: Download source subscription
+        run: |
+          set -e
+
+          curl -fL \
+            --retry 3 \
+            --connect-timeout 20 \
+            --max-time 120 \
+            "https://github.com/Au1rxx/free-vpn-subscriptions/raw/main/output/v2ray-base64.txt" \
+            -o source.txt
+
+          test -s source.txt
+
+          echo "源订阅下载成功"
+          wc -c source.txt
+
+      - name: Install sing-box
+        run: |
+          set -e
+
+          URL=$(curl -fsSL \
+            https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+            | jq -r '.assets[] |
+              select(.name | test("linux-amd64.*\\.tar\\.gz$")) |
+              .browser_download_url' \
+            | head -n 1)
+
+          if [ -z "$URL" ] || [ "$URL" = "null" ]; then
+            echo "无法找到 sing-box"
+            exit 1
+          fi
+
+          echo "下载 sing-box:"
+          echo "$URL"
+
+          curl -fL "$URL" -o sing-box.tar.gz
+
+          mkdir -p sing-box
+
+          tar -xzf sing-box.tar.gz \
+            -C sing-box \
+            --strip-components=1
+
+          chmod +x sing-box/sing-box
+
+          ./sing-box/sing-box version
+
+      - name: Decode V2Ray subscription
+        run: |
+          python3 - <<'PY'
+          import base64
+          import re
+
+          raw = open("source.txt", "rb").read()
+
+          raw = re.sub(rb"\s+", b"", raw)
+
+          try:
+              decoded = base64.b64decode(
+                  raw + b"===",
+                  validate=False
+              )
+          except Exception:
+              decoded = base64.urlsafe_b64decode(
+                  raw + b"==="
+              )
+
+          text = decoded.decode(
+              "utf-8",
+              errors="ignore"
+          )
+
+          lines = [
+              x.strip()
+              for x in text.splitlines()
+              if x.strip()
+          ]
+
+          nodes = []
+
+          for line in lines:
+              if "://" in line:
+                  nodes.append(line)
+
+          print("解码后节点:", len(nodes))
+
+          if not nodes:
+              raise SystemExit("没有解析到 V2Ray 节点")
+
+          with open(
+              "nodes.txt",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              f.write("\n".join(nodes))
+              f.write("\n")
+          PY
+
+      - name: Build sing-box test jobs
+        run: |
+          python3 - <<'PY'
+          import base64
+          import json
+          import urllib.parse
+          import re
+
+          nodes = [
+              x.strip()
+              for x in open(
+                  "nodes.txt",
+                  encoding="utf-8"
+              )
+              if x.strip()
+          ]
+
+          jobs = []
+
+          for index, node in enumerate(nodes):
+
+              try:
+                  scheme = node.split(
+                      "://",
+                      1
+                  )[0].lower()
+
+                  tag = f"node-{index}"
+
+                  if scheme == "vmess":
+
+                      payload = node.split(
+                          "://",
+                          1
+                      )[1]
+
+                      payload += "=" * (
+                          -len(payload) % 4
+                      )
+
+                      obj = json.loads(
+                          base64.urlsafe_b64decode(
+                              payload
+                          ).decode(
+                              "utf-8",
+                              errors="ignore"
+                          )
+                      )
+
+                      server = obj.get("add")
+                      port = int(
+                          obj.get(
+                              "port",
+                              443
+                          )
+                      )
+                      uuid = obj.get("id")
+
+                      if not server or not uuid:
+                          continue
+
+                      outbound = {
+                          "type": "vmess",
+                          "tag": tag,
+                          "server": server,
+                          "server_port": port,
+                          "uuid": uuid,
+                          "security": obj.get(
+                              "scy",
+                              "auto"
+                          ),
+                          "alter_id": int(
+                              obj.get(
+                                  "aid",
+                                  0
+                              )
+                          )
+                      }
+
+                      if obj.get("tls") == "tls":
+
+                          tls = {
+                              "enabled": True
+                          }
+
+                          sni = (
+                              obj.get("sni")
+                              or obj.get("host")
+                          )
+
+                          if sni:
+                              tls["server_name"] = sni
+
+                          outbound["tls"] = tls
+
+                      jobs.append({
+                          "tag": tag,
+                          "original": node,
+                          "outbound": outbound
+                      })
+
+                  elif scheme == "vless":
+
+                      parsed = urllib.parse.urlparse(
+                          node
+                      )
+
+                      if not parsed.hostname:
+                          continue
+
+                      outbound = {
+                          "type": "vless",
+                          "tag": tag,
+                          "server": parsed.hostname,
+                          "server_port": parsed.port or 443,
+                          "uuid": urllib.parse.unquote(
+                              parsed.username or ""
+                          )
+                      }
+
+                      params = urllib.parse.parse_qs(
+                          parsed.query
+                      )
+
+                      security = params.get(
+                          "security",
+                          [None]
+                      )[0]
+
+                      sni = params.get(
+                          "sni",
+                          [None]
+                      )[0]
+
+                      if security in (
+                          "tls",
+                          "reality"
+                      ):
+                          tls = {
+                              "enabled": True
+                          }
+
+                          if sni:
+                              tls["server_name"] = sni
+
+                          if security == "reality":
+
+                              pbk = params.get(
+                                  "pbk",
+                                  [None]
+                              )[0]
+
+                              sid = params.get(
+                                  "sid",
+                                  [None]
+                              )[0]
+
+                              if pbk:
+                                  tls["reality"] = {
+                                      "enabled": True,
+                                      "public_key": pbk
+                                  }
+
+                                  if sid:
+                                      tls["reality"]["short_id"] = sid
+
+                          outbound["tls"] = tls
+
+                      jobs.append({
+                          "tag": tag,
+                          "original": node,
+                          "outbound": outbound
+                      })
+
+                  elif scheme == "trojan":
+
+                      parsed = urllib.parse.urlparse(
+                          node
+                      )
+
+                      if not parsed.hostname:
+                          continue
+
+                      params = urllib.parse.parse_qs(
+                          parsed.query
+                      )
+
+                      outbound = {
+                          "type": "trojan",
+                          "tag": tag,
+                          "server": parsed.hostname,
+                          "server_port": parsed.port or 443,
+                          "password": urllib.parse.unquote(
+                              parsed.username or ""
+                          )
+                      }
+
+                      sni = params.get(
+                          "sni",
+                          [None]
+                      )[0]
+
+                      if sni:
+                          outbound["tls"] = {
+                              "enabled": True,
+                              "server_name": sni
+                          }
+
+                      jobs.append({
+                          "tag": tag,
+                          "original": node,
+                          "outbound": outbound
+                      })
+
+                  elif scheme == "ss":
+
+                      parsed = urllib.parse.urlparse(
+                          node
+                      )
+
+                      if not parsed.hostname:
+                          continue
+
+                      userinfo = parsed.username or ""
+
+                      if ":" not in userinfo:
+                          try:
+                              decoded = base64.urlsafe_b64decode(
+                                  userinfo + "==="
+                              ).decode()
+                              userinfo = decoded
+                          except Exception:
+                              continue
+
+                      method, password = userinfo.split(
+                          ":",
+                          1
+                      )
+
+                      outbound = {
+                          "type": "shadowsocks",
+                          "tag": tag,
+                          "server": parsed.hostname,
+                          "server_port": parsed.port or 443,
+                          "method": method,
+                          "password": password
+                      }
+
+                      jobs.append({
+                          "tag": tag,
+                          "original": node,
+                          "outbound": outbound
+                      })
+
+              except Exception:
+                  continue
+
+          print("成功转换节点:", len(jobs))
+
+          with open(
+              "jobs.json",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              json.dump(
+                  jobs,
+                  f,
+                  ensure_ascii=False,
+                  indent=2
+              )
+          PY
+
+      - name: Test nodes with real HTTP traffic
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import time
+          import urllib.request
+          import urllib.error
+
+          jobs = json.load(
+              open(
+                  "jobs.json",
+                  encoding="utf-8"
+              )
+          )
+
+          os.makedirs(
+              "tests",
+              exist_ok=True
+          )
+
+          alive = []
+          dead = []
+
+          TEST_URL = (
+              "https://www.gstatic.com/"
+              "generate_204"
+          )
+
+          for index, job in enumerate(
+              jobs,
+              1
+          ):
+
+              tag = job["tag"]
+
+              config = {
+                  "log": {
+                      "level": "error"
+                  },
+
+                  "inbounds": [
+                      {
+                          "type": "mixed",
+                          "listen": "127.0.0.1",
+                          "listen_port": 10000,
+                          "tag": "local"
+                      }
+                  ],
+
+                  "outbounds": [
+                      job["outbound"],
+
+                      {
+                          "type": "direct",
+                          "tag": "direct"
+                      },
+
+                      {
+                          "type": "block",
+                          "tag": "block"
+                      }
+                  ],
+
+                  "route": {
+                      "final": tag
+                  }
+              }
+
+              path = (
+                  f"tests/{index}.json"
+              )
+
+              with open(
+                  path,
+                  "w",
+                  encoding="utf-8"
+              ) as f:
+                  json.dump(
+                      config,
+                      f,
+                      ensure_ascii=False
+                  )
+
+              try:
+
+                  check = subprocess.run(
+                      [
+                          "./sing-box/sing-box",
+                          "check",
+                          "-c",
+                          path
+                      ],
+                      stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL,
+                      timeout=10
+                  )
+
+                  if check.returncode != 0:
+                      dead.append(
+                          job["original"]
+                      )
+                      print(
+                          f"[{index}/{len(jobs)}] "
+                          f"CHECK FAIL {tag}"
+                      )
+                      continue
+
+                  process = subprocess.Popen(
+                      [
+                          "./sing-box/sing-box",
+                          "run",
+                          "-c",
+                          path
+                      ],
+                      stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL
+                  )
+
+                  time.sleep(1)
+
+                  start = time.time()
+
+                  proxy_handler = (
+                      urllib.request.ProxyHandler(
+                          {
+                              "http": "http://127.0.0.1:10000",
+                              "https": "http://127.0.0.1:10000"
+                          }
+                      )
+                  )
+
+                  opener = urllib.request.build_opener(
+                      proxy_handler
+                  )
+
+                  request = urllib.request.Request(
+                      TEST_URL,
+                      headers={
+                          "User-Agent":
+                          "Mozilla/5.0"
+                      }
+                  )
+
+                  with opener.open(
+                      request,
+                      timeout=7
+                  ) as response:
+
+                      status = response.status
+
+                  elapsed = int(
+                      (time.time() - start) * 1000
+                  )
+
+                  process.terminate()
+
+                  if status == 204:
+
+                      alive.append({
+                          "node": job["original"],
+                          "delay": elapsed
+                      })
+
+                      print(
+                          f"[{index}/{len(jobs)}] "
+                          f"OK {elapsed}ms {tag}"
+                      )
+
+                  else:
+
+                      dead.append(
+                          job["original"]
+                      )
+
+                      print(
+                          f"[{index}/{len(jobs)}] "
+                          f"BAD HTTP {status} {tag}"
+                      )
+
+              except Exception as e:
+
+                  try:
+                      process.terminate()
+                  except Exception:
+                      pass
+
+                  dead.append(
+                      job["original"]
+                  )
+
+                  print(
+                      f"[{index}/{len(jobs)}] "
+                      f"TIMEOUT {tag}"
+                  )
+
+          alive.sort(
+              key=lambda x: x["delay"]
+          )
+
+          print("=" * 60)
+          print(
+              "可用节点:",
+              len(alive)
+          )
+
+          print(
+              "无效节点:",
+              len(dead)
+          )
+
+          with open(
+              "alive.json",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              json.dump(
+                  alive,
+                  f,
+                  ensure_ascii=False,
+                  indent=2
+              )
+
+          if not alive:
+              raise SystemExit(
+                  "没有节点通过真实 HTTP 测试，停止更新"
+              )
+          PY
+
+      - name: Generate clean V2Ray Base64
+        run: |
+          python3 - <<'PY'
+          import base64
+          import json
+
+          alive = json.load(
+              open(
+                  "alive.json",
+                  encoding="utf-8"
+              )
+          )
+
+          nodes = [
+              item["node"]
+              for item in alive
+          ]
+
+          content = (
+              "\n".join(nodes)
+              + "\n"
+          )
+
+          encoded = base64.b64encode(
+              content.encode("utf-8")
+          ).decode("ascii")
+
+          with open(
+              "v2ray-base64.txt",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              f.write(encoded)
+
+          print(
+              "最终可用节点:",
+              len(nodes)
+          )
+          PY
+
+      - name: Validate final subscription
+        run: |
+          python3 - <<'PY'
+          import base64
+
+          encoded = open(
+              "v2ray-base64.txt",
+              encoding="utf-8"
+          ).read().strip()
+
+          decoded = base64.b64decode(
+              encoded + "===",
+              validate=False
+          ).decode(
+              "utf-8",
+              errors="ignore"
+          )
+
+          nodes = [
+              x.strip()
+              for x in decoded.splitlines()
+              if "://" in x
+          ]
+
+          print(
+              "最终订阅节点:",
+              len(nodes)
+          )
+
+          if not nodes:
+              raise SystemExit(
+                  "最终订阅为空"
+              )
+          PY
+
+      - name: Commit result
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add v2ray-base64.txt
+
+          if git diff --cached --quiet; then
+            echo "没有变化"
+          else
+            git commit -m "Update verified V2Ray nodes"
+            git push
+          fi
